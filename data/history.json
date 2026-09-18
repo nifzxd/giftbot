@@ -1,0 +1,29 @@
+[
+  {
+    "payload": "gift_8755618586_5170233102089322756_1789696237777_uf07l8",
+    "buyerId": 8755618586,
+    "buyerLabel": "@qheree",
+    "recipientId": 8755618586,
+    "recipientLabel": "@qheree",
+    "giftId": "5170233102089322756",
+    "giftName": "Boneka Beruang 🧸",
+    "price": 8,
+    "text": "",
+    "status": "FAILED",
+    "error": "Telegram API Error (sendGift): Bad Request: BALANCE_TOO_LOW",
+    "timestamp": 1789696246263
+  },
+  {
+    "payload": "gift_1964747665_5170145012310081615_1789654635128_8s5zju",
+    "buyerId": 1964747665,
+    "buyerLabel": "@dimzxzzo",
+    "recipientId": 80514100,
+    "recipientLabel": "@nifxx",
+    "giftId": "5170145012310081615",
+    "giftName": "Hati 💖",
+    "price": 15,
+    "text": "",
+    "status": "SENT",
+    "timestamp": 1789654644010
+  }
+]
