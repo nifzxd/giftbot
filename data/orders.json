@@ -1,0 +1,120 @@
+[
+  {
+    "buyerId": 410685021,
+    "giftId": "5170145012310081615",
+    "giftName": "Hati 💖",
+    "price": 15,
+    "status": "WAITING_RECIPIENT",
+    "createdAt": 1789644711906
+  },
+  {
+    "buyerId": 1354365648,
+    "giftId": "5170145012310081615",
+    "giftName": "Hati 💖",
+    "price": 15,
+    "status": "PAYMENT_CREATED",
+    "createdAt": 1789647658085,
+    "recipientId": 1354365648,
+    "recipientUsername": "@geabl",
+    "text": "",
+    "payload": "gift_1354365648_5170145012310081615_1789647675770_qddd5d"
+  },
+  {
+    "buyerId": 917653913,
+    "giftId": "5170145012310081615",
+    "giftName": "Hati 💖",
+    "price": 15,
+    "status": "WAITING_PAYMENT",
+    "createdAt": 1789647990724,
+    "recipientId": 917653913,
+    "recipientUsername": "@heeroik",
+    "text": ""
+  },
+  {
+    "buyerId": 8807250188,
+    "giftId": "5170145012310081615",
+    "giftName": "Hati 💖",
+    "price": 15,
+    "status": "WAITING_RECIPIENT",
+    "createdAt": 1789648020976
+  },
+  {
+    "buyerId": 8428510598,
+    "giftId": "5170145012310081615",
+    "giftName": "Hati 💖",
+    "price": 15,
+    "status": "PAYMENT_CREATED",
+    "createdAt": 1789648128628,
+    "recipientId": 8428510598,
+    "recipientUsername": "@haxma",
+    "text": "",
+    "payload": "gift_8428510598_5170145012310081615_1789648146847_71qu4h"
+  },
+  {
+    "buyerId": 1710485614,
+    "giftId": "5170145012310081615",
+    "giftName": "Hati 💖",
+    "price": 15,
+    "status": "PAYMENT_CREATED",
+    "createdAt": 1789661081833,
+    "recipientId": 1710485614,
+    "recipientUsername": "@eroticald",
+    "text": "",
+    "payload": "gift_1710485614_5170145012310081615_1789661102654_81m88u"
+  },
+  {
+    "buyerId": 7632742875,
+    "giftId": "5170145012310081615",
+    "giftName": "Hati 💖",
+    "price": 15,
+    "status": "WAITING_MESSAGE_CHOICE",
+    "createdAt": 1789661110359,
+    "recipientId": 7632742875,
+    "recipientUsername": "@kayyloavv"
+  },
+  {
+    "buyerId": 6966581823,
+    "giftId": "5170233102089322756",
+    "giftName": "Boneka Beruang 🧸",
+    "price": 15,
+    "status": "WAITING_RECIPIENT",
+    "createdAt": 1789661815493
+  },
+  {
+    "buyerId": 8755618586,
+    "giftId": "5170233102089322756",
+    "giftName": "Boneka Beruang 🧸",
+    "price": 8,
+    "status": "FAILED",
+    "createdAt": 1789696217820,
+    "recipientId": 8755618586,
+    "recipientUsername": "@qheree",
+    "text": "",
+    "payload": "gift_8755618586_5170233102089322756_1789696237777_uf07l8",
+    "error": "Telegram API Error (sendGift): Bad Request: BALANCE_TOO_LOW"
+  },
+  {
+    "buyerId": 8710533255,
+    "giftId": "5170250947678437525",
+    "giftName": "Kotak Hadiah 🎁",
+    "price": 25,
+    "status": "PAYMENT_CREATED",
+    "createdAt": 1789698339182,
+    "recipientId": 8710533255,
+    "recipientUsername": "@jourqdain",
+    "text": "",
+    "payload": "gift_8710533255_5170250947678437525_1789698363920_1nth41"
+  },
+  {
+    "buyerId": 6507577628,
+    "giftId": "5170145012310081615",
+    "giftName": "Hati 💖",
+    "price": 15,
+    "status": "PAYMENT_CREATED",
+    "createdAt": 1789698739146,
+    "recipientId": 6507577628,
+    "recipientUsername": "@sawiitt",
+    "text": "",
+    "payload": "gift_6507577628_5170145012310081615_1789698755853_9o3og9"
+  }
+]
