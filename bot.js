@@ -1,16 +1,35 @@
 const TelegramBot = require("node-telegram-bot-api");
 const axios = require("axios");
-const fs = require("fs");
 
 // ==============================
 // CONFIG & ENVIRONMENT
 // ==============================
 
-// ==============================
-// CONFIG (config.js)
-// ==============================
-
 const config = require("./config");
+
+const {
+  connectDB,
+  getDB,
+  closeDB,
+  findUserById,
+  findUserByUsername,
+  upsertUser,
+  findOrderByBuyerId,
+  findOrderByPayload,
+  upsertOrder,
+  deleteOrder,
+  getOrders,
+  getOrdersByStatus,
+  addHistory: addHistoryDB,
+  findHistoryByPayload,
+  updateHistoryByChargeId,
+  getHistory,
+  getHistoryByBuyerId,
+  getSettings,
+  updateSettings,
+  setMaintenance,
+  getStats,
+} = require("./database");
 
 const BOT_TOKEN = config.BOT_TOKEN || process.env.BOT_TOKEN;
 const OWNER_ID = Number(config.OWNER_ID || process.env.OWNER_ID || "0");
@@ -27,7 +46,7 @@ if (!OWNER_ID) {
   );
 }
 
-const bot = new TelegramBot(BOT_TOKEN, { polling: true });
+const bot = new TelegramBot(BOT_TOKEN, { polling: false });
 
 // ==============================
 // CUSTOM NAMA GIFT
@@ -48,61 +67,28 @@ const GIFT_CUSTOM_NAMES = {
 };
 
 // ==============================
-// PERSISTENT STORAGE (JSON)
+// DATABASE CACHE
 // ==============================
 
-const DATA_DIR = "./data";
-const USERS_FILE = `${DATA_DIR}/users.json`;
-const ORDERS_FILE = `${DATA_DIR}/orders.json`;
-const HISTORY_FILE = `${DATA_DIR}/history.json`;
+const orders = new Map();
+const users = new Map();
+const history = [];
 
-if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+let settings = {
+  maintenance: false,
+};
 
-function loadJson(file) {
-  try {
-    if (!fs.existsSync(file)) return [];
-    return JSON.parse(fs.readFileSync(file, "utf8"));
-  } catch (err) {
-    console.error(`Gagal load ${file}:`, err.message);
-    return [];
+const processedPayloads = new Set();
+const invoiceCreationLock = new Set();
+
+async function addHistory(entry) {
+  history.unshift(entry);
+
+  if (history.length > 1000) {
+    history.length = 1000;
   }
-}
 
-function saveJson(file, data) {
-  try {
-    fs.writeFileSync(file, JSON.stringify(data, null, 2));
-  } catch (err) {
-    console.error(`Gagal save ${file}:`, err.message);
-  }
-}
-
-// In-memory, dihydrate dari disk saat start
-const orders = new Map(
-  loadJson(ORDERS_FILE).map((o) => [String(o.buyerId), o]),
-);
-const users = new Map(loadJson(USERS_FILE).map((u) => [String(u.id), u]));
-const history = loadJson(HISTORY_FILE);
-
-// FIX (#4): Idempotency — payload yang sudah berhasil diproses tidak akan
-// diproses ulang (mencegah gift terkirim dua kali saat update di-redeliver
-// Telegram setelah proses crash/restart).
-const processedPayloads = new Set(
-  history.filter((h) => h.status === "SENT").map((h) => h.payload),
-);
-
-// Catat order selesai ke riwayat (dipakai /orders, /myorders, audit trail)
-function addHistory(entry) {
-  history.unshift(entry); // terbaru di awal
-  if (history.length > 1000) history.length = 1000; // batasi ukuran file
-  saveJson(HISTORY_FILE, history);
-}
-
-function saveUsers() {
-  saveJson(USERS_FILE, [...users.values()]);
-}
-
-function saveOrders() {
-  saveJson(ORDERS_FILE, [...orders.values()]);
+  await addHistoryDB(entry);
 }
 
 // ==============================
@@ -121,73 +107,70 @@ function isOwner(userId) {
   return Number(userId) === OWNER_ID;
 }
 
-function trackUser(from) {
+async function trackUser(from) {
   if (!from || from.is_bot) return;
+
   const key = String(from.id);
   const existing = users.get(key);
-  users.set(key, {
+
+  const user = {
     id: from.id,
     username: from.username
       ? from.username.toLowerCase()
       : (existing?.username ?? null),
     first_name: from.first_name || (existing?.first_name ?? ""),
     updatedAt: Date.now(),
-  });
-  saveUsers();
+  };
+
+  users.set(key, user);
+
+  await upsertUser(user);
 }
 
 function getGiftName(gift) {
   if (GIFT_CUSTOM_NAMES[gift.id]) {
     return GIFT_CUSTOM_NAMES[gift.id];
   }
-
   const emoji = gift.sticker?.emoji ? `${gift.sticker.emoji} ` : "🎁";
   return `${emoji} Gift #${gift.id}`;
 }
 
-function setOrder(userId, order) {
+async function setOrder(userId, order) {
   orders.set(String(userId), order);
-  saveOrders();
+  await upsertOrder(order);
 }
 
-function clearOrder(userId) {
+async function clearOrder(userId) {
   orders.delete(String(userId));
-  saveOrders();
+  await deleteOrder(userId);
 }
 
-// FIX (#1 & #2): helper — order dengan invoice aktif / hasil gagal tidak boleh
-// ditimpa atau dihapus sembarangan.
 function hasActivePaymentOrder(userId) {
   const o = orders.get(String(userId));
-  return o && (o.status === "PAYMENT_CREATED" || o.status === "PAID");
+  return (
+    o &&
+    ["PAYMENT_CREATED", "PAID", "PROCESSING", "REFUNDING"].includes(o.status)
+  );
 }
 
 // ==============================
 // UI HELPERS — TYPING, EDIT & DELETE
 // ==============================
 
-// Indicator "sedang mengetik..."
 async function sendTyping(chatId) {
   try {
     await bot.sendChatAction(chatId, "typing");
-  } catch {
-    /* abaikan */
-  }
+  } catch (_) {}
 }
 
-// FIX (#6): Pesan bot terakhir per chat disimpan dengan timestamp,
-// dibersihkan berkala supaya Map tidak membengkak (memory leak).
-const lastBotMsg = new Map(); // chatId(String) -> { id, at }
+const lastBotMsg = new Map();
+// Memori untuk menyimpan message_id command terakhir dari setiap user
+const lastUserCommandMsg = new Map();
 
 function rememberBotMsg(chatId, messageId) {
   lastBotMsg.set(String(chatId), { id: messageId, at: Date.now() });
 }
 
-function getLastBotMsgId(chatId) {
-  return lastBotMsg.get(String(chatId))?.id;
-}
-
-// Kirim pesan baru, atau EDIT pesan bot terakhir di chat
 async function sendBotMessage(chatId, text, opts = {}) {
   const last = lastBotMsg.get(String(chatId));
   if (last) {
@@ -198,35 +181,27 @@ async function sendBotMessage(chatId, text, opts = {}) {
         ...opts,
       });
       return last.id;
-    } catch {
-      // fallback: kirim pesan baru
-    }
+    } catch (_) {}
   }
   const sent = await bot.sendMessage(chatId, text, opts);
   rememberBotMsg(chatId, sent.message_id);
   return sent.message_id;
 }
 
-// Hapus pesan bot terakhir di chat
 async function clearBotMessages(chatId) {
   const last = lastBotMsg.get(String(chatId));
   if (last) {
     try {
       await bot.deleteMessage(chatId, last.id);
-    } catch {
-      /* abaikan */
-    }
+    } catch (_) {}
     lastBotMsg.delete(String(chatId));
   }
 }
 
-// Hapus pesan user (input username / pesan gift)
 async function deleteUserMessage(msg) {
   try {
     await bot.deleteMessage(msg.chat.id, msg.message_id);
-  } catch {
-    /* abaikan */
-  }
+  } catch (_) {}
 }
 
 // ==============================
@@ -247,7 +222,6 @@ async function telegramApi(method, data = {}) {
 }
 
 async function getAvailableGifts(forceRefresh = false) {
-  // Cache 60 detik untuk mengurangi API call
   const now = Date.now();
   if (
     !forceRefresh &&
@@ -275,46 +249,42 @@ async function getStarTransactions(offset = 0, limit = 20) {
   return telegramApi("getStarTransactions", { offset, limit });
 }
 
+async function refundStarPayment(userId, chargeId) {
+  return telegramApi("refundStarPayment", {
+    user_id: Number(userId),
+    telegram_payment_charge_id: chargeId,
+  });
+}
+
 // ==============================
 // CLEANUP & AUTOSAVE
 // ==============================
 
-// Aturan cleanup:
-// - Order tahap input (WAITING_*) TIDAK pernah dihapus otomatis — hilang hanya
-//   saat user ketik /cancel, order ulang, atau timpa dengan gift baru.
-// - PAYMENT_CREATED: dihapus setelah 24 jam (invoice sudah pasti basi).
-// - PAID & FAILED: dipertahankan 24 jam untuk investigasi owner.
+// Cleanup yang tidak menghapus status FAILED, REFUNDING, REFUND_FAILED yang belum aman
 setInterval(
-  () => {
+  async () => {
     const now = Date.now();
-    let changed = false;
+
     for (const [userId, order] of orders.entries()) {
       if (!order.createdAt) continue;
-      if (!["PAYMENT_CREATED", "PAID", "FAILED"].includes(order.status))
-        continue;
-      if (now - order.createdAt > 24 * 60 * 60 * 1000) {
+
+      if (
+        ["SENT", "REFUNDED"].includes(order.status) &&
+        now - order.createdAt > 2 * 60 * 60 * 1000
+      ) {
         orders.delete(userId);
-        changed = true;
+        await deleteOrder(userId);
+      } else if (
+        order.status === "PAYMENT_CREATED" &&
+        now - order.createdAt > 24 * 60 * 60 * 1000
+      ) {
+        orders.delete(userId);
+        await deleteOrder(userId);
       }
     }
-    if (changed) saveOrders();
   },
   5 * 60 * 1000,
 );
-
-// FIX (#6): Bersihkan lastBotMsg yang sudah lama tidak dipakai (anti memory leak)
-setInterval(
-  () => {
-    const now = Date.now();
-    for (const [chatId, entry] of lastBotMsg.entries()) {
-      if (now - entry.at > 24 * 60 * 60 * 1000) lastBotMsg.delete(chatId);
-    }
-  },
-  60 * 60 * 1000,
-);
-
-// Backup berkala ke disk (aman jika proses mati mendadak)
-setInterval(saveOrders, 60 * 1000);
 
 // ==============================
 // ORDER SUMMARY HELPER
@@ -343,7 +313,6 @@ async function showOrderSummary(chatId, order, editMessageId = null) {
     },
   };
 
-  // Edit pesan lama kalau diminta (chat tetap rapi, tidak menumpuk)
   if (editMessageId) {
     try {
       await bot.editMessageText(summaryText, {
@@ -353,48 +322,64 @@ async function showOrderSummary(chatId, order, editMessageId = null) {
       });
       rememberBotMsg(chatId, editMessageId);
       return;
-    } catch {
-      // fallback: kirim pesan baru
-    }
+    } catch (_) {}
   }
 
   await sendBotMessage(chatId, summaryText, options);
 }
 
 // ==============================
+// MAINTENANCE GUARD HELPER
+// ==============================
+
+function isMaintenanceActive(userId) {
+  return settings.maintenance && !isOwner(userId);
+}
+
+function sendMaintenanceMsg(chatId) {
+  return sendBotMessage(
+    chatId,
+    `🛠️ <b>Nifz Gift Bot sedang maintenance.</b>\n\nSilakan coba lagi nanti.`,
+    { parse_mode: "HTML" },
+  );
+}
+
+// ==============================
 // BOT COMMANDS
 // ==============================
 
-// FIX (#7): regex mendukung suffix @NamaBot untuk pemakaian di grup
 // /start
 bot.onText(/^\/start(?:@\w+)?$/, async (msg) => {
-  trackUser(msg.from);
+  await trackUser(msg.from);
   const chatId = msg.chat.id;
   const userId = msg.from.id;
 
-  // FIX (#2): Jangan hapus order yang masih punya invoice aktif —
-  // invoice lama tetap bisa dibayar. Cukup abaikan, beri tahu user.
   if (hasActivePaymentOrder(userId)) {
     return sendBotMessage(
       chatId,
-      "⚠️ Kamu masih punya invoice yang belum dibayar.\nSelesaikan pembayaran, atau ketik /cancel untuk membatalkan dan membuat order baru.",
+      "⚠️ Kamu masih punya order/invoice yang sedang berjalan.\nSelesaikan pembayaran, atau ketik /cancel untuk membatalkan.",
       { parse_mode: "HTML" },
     );
   }
 
-  clearOrder(userId);
-
+  await clearOrder(userId);
   await sendTyping(chatId);
 
   const name =
     msg.from.first_name ||
     (msg.from.username ? `@${msg.from.username}` : "kak");
 
+  let maintenanceNotice = "";
+  if (settings.maintenance) {
+    maintenanceNotice =
+      "\n\n⚠️ <i>Bot sedang dalam mode maintenance. Pembuatan order baru dinonaktifkan sementara.</i>";
+  }
+
   await sendBotMessage(
     chatId,
     `👋 <b>Halo, ${escapeHtml(name)}!</b>\n\n` +
       `Selamat datang di <b>Nifz Gift Bot</b> 🎁\n` +
-      `Kirim gift Telegram Stars ke temanmu dengan mudah dan cepat!\n\n` +
+      `Kirim gift Telegram Stars ke temanmu dengan mudah dan cepat!${maintenanceNotice}\n\n` +
       `Silakan pilih menu di bawah ini:`,
     {
       parse_mode: "HTML",
@@ -411,28 +396,24 @@ bot.onText(/^\/start(?:@\w+)?$/, async (msg) => {
 
 // /cancel
 bot.onText(/^\/cancel(?:@\w+)?$/, async (msg) => {
-  trackUser(msg.from);
+  await trackUser(msg.from);
   const userId = msg.from.id;
-
   const order = orders.get(String(userId));
 
   if (!order) {
     return sendBotMessage(msg.chat.id, "Tidak ada order yang sedang berjalan.");
   }
 
-  // Order yang pembayarannya sedang diproses tidak bisa dibatalkan
-  if (order.status === "PAID") {
+  if (["PAID", "PROCESSING", "REFUNDING"].includes(order.status)) {
     return sendBotMessage(
       msg.chat.id,
-      "⚠️ Pembayaranmu sedang diproses. Gift akan dikirim otomatis dalam beberapa saat.",
+      "⚠️ Pembayaranmu sedang diproses. Order tidak dapat dibatalkan saat ini.",
       { parse_mode: "HTML" },
     );
   }
 
-  // Order dihapus INSTAN begitu user klik /cancel
   const hadInvoice = order.status === "PAYMENT_CREATED";
-  clearOrder(userId);
-  // Hapus pesan summary/invoice yang tersisa supaya chat rapi
+  await clearOrder(userId);
   await clearBotMessages(msg.chat.id);
 
   let text = "✅ Order berhasil dibatalkan.\n\nKetik /start untuk order baru.";
@@ -445,93 +426,9 @@ bot.onText(/^\/cancel(?:@\w+)?$/, async (msg) => {
   return sendBotMessage(msg.chat.id, text);
 });
 
-// /transactions (Owner Only)
-bot.onText(/^\/transactions(?:@\w+)?$/, async (msg) => {
-  trackUser(msg.from);
-  if (!isOwner(msg.from.id)) {
-    return sendBotMessage(msg.chat.id, "❌ Command ini khusus owner.");
-  }
-
-  await sendTyping(msg.chat.id);
-
-  try {
-    const data = await getStarTransactions(0, 20);
-    const transactions = data?.transactions || [];
-
-    if (!transactions.length) {
-      return sendBotMessage(msg.chat.id, "📭 Belum ada transaksi Stars.");
-    }
-
-    let text = "📊 <b>20 TRANSAKSI TERAKHIR</b>\n\n";
-    for (const tx of transactions) {
-      const sign = tx.amount >= 0 ? "+" : "";
-      const partner = tx.source?.type || tx.receiver?.type || "unknown";
-      text += `⭐ ${sign}${tx.amount}\n🔹 ${escapeHtml(partner)}\n🆔 <code>${escapeHtml(tx.id)}</code>\n\n`;
-    }
-
-    await sendBotMessage(msg.chat.id, text, { parse_mode: "HTML" });
-  } catch (err) {
-    console.error(err.message);
-    sendBotMessage(
-      msg.chat.id,
-      `❌ Gagal mengambil transaksi.\n\n${escapeHtml(err.message)}`,
-    );
-  }
-});
-
-// /stats (Owner Only)
-bot.onText(/^\/stats(?:@\w+)?$/, (msg) => {
-  trackUser(msg.from);
-  if (!isOwner(msg.from.id)) {
-    return sendBotMessage(msg.chat.id, "❌ Command ini khusus owner.");
-  }
-
-  const activeOrders = orders.size;
-  const totalUsers = users.size;
-  const paidOrders = [...orders.values()].filter(
-    (o) => o.status === "PAID",
-  ).length;
-
-  sendBotMessage(
-    msg.chat.id,
-    `📈 <b>STATISTIK BOT</b>\n\n👥 Total User Terdata: <b>${totalUsers}</b>\n📦 Order Aktif: <b>${activeOrders}</b>\n💰 Order Terbayar (pending kirim): <b>${paidOrders}</b>`,
-    { parse_mode: "HTML" },
-  );
-});
-
-// /orders [jumlah] (Owner Only) — riwayat order lokal
-bot.onText(/^\/orders(?:@\w+)?(?:\s+(\d+))?$/, async (msg, match) => {
-  trackUser(msg.from);
-  if (!isOwner(msg.from.id)) {
-    return sendBotMessage(msg.chat.id, "❌ Command ini khusus owner.");
-  }
-
-  const limit = Math.min(Math.max(Number(match[1] || 10), 1), 50);
-
-  if (!history.length) {
-    return sendBotMessage(msg.chat.id, "📭 Belum ada riwayat order.");
-  }
-
-  await sendTyping(msg.chat.id);
-
-  let text = `📜 <b>RIWAYAT ORDER TERAKHIR (${Math.min(limit, history.length)})</b>\n\n`;
-  for (const h of history.slice(0, limit)) {
-    const t = new Date(h.timestamp).toLocaleString("id-ID", {
-      timeZone: "Asia/Jakarta",
-    });
-    text +=
-      `${h.status === "SENT" ? "✅" : "❌"} ${escapeHtml(h.giftName)} — ${h.price} ⭐\n` +
-      `👤 ${escapeHtml(h.buyerLabel || String(h.buyerId))} → ${escapeHtml(h.recipientLabel || String(h.recipientId))}\n` +
-      (h.text ? `💌 "${escapeHtml(h.text)}"\n` : "") +
-      `🕒 ${t}\n\n`;
-  }
-
-  await sendBotMessage(msg.chat.id, text, { parse_mode: "HTML" });
-});
-
-// /myorders — riwayat kirim gift milik user yang login
+// /myorders
 bot.onText(/^\/myorders(?:@\w+)?$/, async (msg) => {
-  trackUser(msg.from);
+  await trackUser(msg.from);
   const mine = history
     .filter((h) => Number(h.buyerId) === msg.from.id)
     .slice(0, 10);
@@ -544,45 +441,422 @@ bot.onText(/^\/myorders(?:@\w+)?$/, async (msg) => {
 
   let text = `📜 <b>RIWAYAT KIRIM GIFT KAMU</b>\n\n`;
   for (const h of mine) {
-    const t = new Date(h.timestamp).toLocaleString("id-ID", {
-      timeZone: "Asia/Jakarta",
-    });
+    const t = new Date(h.timestamp || h.createdAt || Date.now()).toLocaleString(
+      "id-ID",
+      {
+        timeZone: "Asia/Jakarta",
+      },
+    );
+    const statusIcon =
+      h.status === "SENT"
+        ? "✅"
+        : h.status === "REFUNDED"
+          ? "⭐ (Refunded)"
+          : "❌";
     text +=
-      `${h.status === "SENT" ? "✅" : "❌"} ${escapeHtml(h.giftName)} → ${escapeHtml(h.recipientLabel)}\n` +
+      `${statusIcon} ${escapeHtml(h.giftName)} → ${escapeHtml(h.recipientLabel || String(h.recipientId))}\n` +
       `💰 ${h.price} ⭐ • 🕒 ${t}\n\n`;
   }
 
   await sendBotMessage(msg.chat.id, text, { parse_mode: "HTML" });
 });
 
-// /broadcast <pesan> (Owner Only)
-bot.onText(/^\/broadcast(?:@\w+)? (.+)/, async (msg, match) => {
-  trackUser(msg.from);
-  if (!isOwner(msg.from.id)) {
+// OWNER COMMAND: /maintenance
+bot.onText(/^\/maintenance(?:@\w+)?$/, async (msg) => {
+  await trackUser(msg.from);
+  if (!isOwner(msg.from.id))
     return sendBotMessage(msg.chat.id, "❌ Command ini khusus owner.");
+
+  settings.maintenance = !settings.maintenance;
+  await setMaintenance(settings.maintenance);
+
+  const statusText = settings.maintenance
+    ? "🔴 Maintenance sekarang: ON"
+    : "🟢 Maintenance sekarang: OFF";
+  console.log(`[ORDER] Owner toggled maintenance: ${settings.maintenance}`);
+  return sendBotMessage(
+    msg.chat.id,
+    `🛠️ <b>MAINTENANCE MODE</b>\n\n${statusText}`,
+    { parse_mode: "HTML" },
+  );
+});
+
+// OWNER COMMAND: /balance
+bot.onText(/^\/balance(?:@\w+)?$/, async (msg) => {
+  await trackUser(msg.from);
+  if (!isOwner(msg.from.id))
+    return sendBotMessage(msg.chat.id, "❌ Command ini khusus owner.");
+
+  await sendTyping(msg.chat.id);
+  try {
+    const me = await telegramApi("getMe");
+    // Gunakan getMyStarBalance atau fallback jika ketersediaan API berbeda
+    const result = await telegramApi("getMyStarBalance").catch(async () => {
+      return await telegramApi("getStarTransactions", { offset: 0, limit: 1 });
+    });
+
+    let balanceStr = "N/A";
+    if (typeof result === "number") {
+      balanceStr = result.toLocaleString("id-ID");
+    } else if (result && result.amount !== undefined) {
+      balanceStr = Number(result.amount).toLocaleString("id-ID");
+    } else if (result && result.star_count !== undefined) {
+      balanceStr = Number(result.star_count).toLocaleString("id-ID");
+    }
+
+    await sendBotMessage(
+      msg.chat.id,
+      `⭐ <b>SALDO NIFZ GIFT BOT</b>\n\n💰 Balance: <b>${balanceStr} ⭐</b>`,
+      { parse_mode: "HTML" },
+    );
+  } catch (err) {
+    console.error(`[ERROR /balance] ${err.message}`);
+    sendBotMessage(
+      msg.chat.id,
+      `❌ Gagal mengambil saldo Stars.\n\nError: ${escapeHtml(err.message)}`,
+    );
   }
+});
+
+// OWNER COMMAND: /transactions
+bot.onText(/^\/transactions(?:@\w+)?$/, async (msg) => {
+  await trackUser(msg.from);
+  if (!isOwner(msg.from.id))
+    return sendBotMessage(msg.chat.id, "❌ Command ini khusus owner.");
+
+  await sendTyping(msg.chat.id);
+  try {
+    const data = await getStarTransactions(0, 20);
+    const transactions = data?.transactions || [];
+
+    if (!transactions.length) {
+      return sendBotMessage(msg.chat.id, "📭 Belum ada transaksi Stars.");
+    }
+
+    let text = "📊 <b>TRANSAKSI STARS</b>\n\n";
+    for (const tx of transactions) {
+      const sign = tx.amount >= 0 ? "+" : "";
+      const partner = tx.source?.type || tx.receiver?.type || "transaction";
+      const dateStr = new Date(
+        (tx.date || Date.now() / 1000) * 1000,
+      ).toLocaleString("id-ID", { timeZone: "Asia/Jakarta" });
+      text += `⭐ ${sign}${tx.amount}\n🔹 Type: ${escapeHtml(partner)}\n🆔 ID: <code>${escapeHtml(tx.id || "-")}</code>\n🕒 Date: ${dateStr}\n\n`;
+    }
+
+    await sendBotMessage(msg.chat.id, text, { parse_mode: "HTML" });
+  } catch (err) {
+    logError(`Error /transactions: ${err.message}`);
+    sendBotMessage(
+      msg.chat.id,
+      `❌ Gagal mengambil transaksi.\n\nError: ${escapeHtml(err.message)}`,
+    );
+  }
+});
+
+// OWNER COMMAND: /stats
+bot.onText(/^\/stats(?:@\w+)?$/, async (msg) => {
+  await trackUser(msg.from);
+  if (!isOwner(msg.from.id))
+    return sendBotMessage(msg.chat.id, "❌ Command ini khusus owner.");
+
+  const stats = await getStats();
+
+  const totalUsers = stats.users;
+  const totalOrders = stats.history;
+
+  const successOrders = history.filter((h) => h.status === "SENT");
+  const failedOrders = history.filter(
+    (h) =>
+      h.status === "FAILED" ||
+      h.status === "REFUNDED" ||
+      h.status === "REFUND_FAILED",
+  );
+
+  const totalStars = successOrders.reduce(
+    (acc, curr) => acc + (Number(curr.price) || 0),
+    0,
+  );
+  const totalRefunds = history
+    .filter((h) => h.status === "REFUNDED" || h.refundStatus === "REFUNDED")
+    .reduce((acc, curr) => acc + (Number(curr.price) || 0), 0);
+
+  // Hitung gift paling sering dikirim
+  const giftCounts = {};
+  for (const h of successOrders) {
+    const gName = h.giftName || "Gift Unknown";
+    giftCounts[gName] = (giftCounts[gName] || 0) + 1;
+  }
+
+  let topGiftsText = "-";
+  const sortedGifts = Object.entries(giftCounts).sort((a, b) => b[1] - a[1]);
+  if (sortedGifts.length > 0) {
+    topGiftsText = sortedGifts
+      .slice(0, 3)
+      .map(([name, count]) => `${escapeHtml(name)} — ${count}x`)
+      .join("\n");
+  }
+
+  sendBotMessage(
+    msg.chat.id,
+    `📈 <b>STATISTIK NIFZ GIFT BOT</b>\n\n` +
+      `👥 Total User: <b>${totalUsers}</b>\n\n` +
+      `📦 Total Order: <b>${totalOrders}</b>\n\n` +
+      `✅ Gift Terkirim: <b>${successOrders.length}</b>\n` +
+      `❌ Gift Gagal: <b>${failedOrders.length}</b>\n\n` +
+      `⭐ Total Stars dari Order: <b>${totalStars.toLocaleString("id-ID")} ⭐</b>\n\n` +
+      `💸 Total Refund: <b>${totalRefunds.toLocaleString("id-ID")} ⭐</b>\n\n` +
+      `🎁 Gift Paling Banyak Dikirim:\n${topGiftsText}`,
+    { parse_mode: "HTML" },
+  );
+});
+
+// OWNER COMMAND: /orders
+bot.onText(/^\/orders(?:@\w+)?(?:\s+(\d+))?$/, async (msg, match) => {
+  await trackUser(msg.from);
+  if (!isOwner(msg.from.id))
+    return sendBotMessage(msg.chat.id, "❌ Command ini khusus owner.");
+
+  const limit = Math.min(Math.max(Number(match[1] || 10), 1), 50);
+
+  if (!history.length) {
+    return sendBotMessage(msg.chat.id, "📭 Belum ada riwayat order.");
+  }
+
+  await sendTyping(msg.chat.id);
+
+  let text = `📜 <b>RIWAYAT ORDER TERAKHIR (${Math.min(limit, history.length)})</b>\n\n`;
+  for (const h of history.slice(0, limit)) {
+    const t = new Date(h.timestamp || h.createdAt || Date.now()).toLocaleString(
+      "id-ID",
+      {
+        timeZone: "Asia/Jakarta",
+      },
+    );
+    const statusIcon =
+      h.status === "SENT" ? "✅" : h.status === "REFUNDED" ? "⭐" : "❌";
+    text +=
+      `${statusIcon} <b>${escapeHtml(h.giftName)}</b> — ${h.price} ⭐ [<code>${h.status}</code>]\n` +
+      `👤 ${escapeHtml(h.buyerLabel || String(h.buyerId))} → ${escapeHtml(h.recipientLabel || String(h.recipientId))}\n` +
+      `🧾 Payload: <code>${escapeHtml(h.payload || "-")}</code>\n` +
+      `🕒 ${t}\n\n`;
+  }
+
+  await sendBotMessage(msg.chat.id, text, { parse_mode: "HTML" });
+});
+
+// OWNER COMMAND: /order <payload>
+bot.onText(/^\/order(?:@\w+)?\s+(.+)$/, async (msg, match) => {
+  await trackUser(msg.from);
+  if (!isOwner(msg.from.id))
+    return sendBotMessage(msg.chat.id, "❌ Command ini khusus owner.");
+
+  const payloadTarget = match[1].trim();
+
+  // Cari di active orders dulu
+  let item = [...orders.values()].find((o) => o.payload === payloadTarget);
+  // Jika tidak ada, cari di history
+  if (!item) {
+    item = history.find((h) => h.payload === payloadTarget);
+  }
+
+  if (!item) {
+    return sendBotMessage(msg.chat.id, "❌ Order tidak ditemukan.");
+  }
+
+  const timeStr = new Date(
+    item.timestamp || item.createdAt || Date.now(),
+  ).toLocaleString("id-ID", {
+    timeZone: "Asia/Jakarta",
+  });
+
+  const text =
+    `📦 <b>DETAIL ORDER</b>\n\n` +
+    `👤 Buyer: ${escapeHtml(item.buyerLabel || "-")}\n` +
+    `🆔 Buyer ID: <code>${item.buyerId}</code>\n\n` +
+    `🎁 Gift: ${escapeHtml(item.giftName)}\n` +
+    `🆔 Gift ID: <code>${item.giftId}</code>\n\n` +
+    `👤 Recipient: ${escapeHtml(item.recipientLabel || item.recipientUsername || "-")}\n` +
+    `🆔 Recipient ID: <code>${item.recipientId || "-"}</code>\n\n` +
+    `💰 Harga: ${item.price} ⭐\n\n` +
+    `📌 Status: <b>${item.status}</b>\n\n` +
+    `💳 Charge ID: <code>${escapeHtml(item.telegramPaymentChargeId || "-")}</code>\n` +
+    `🧾 Payload: <code>${escapeHtml(item.payload || "-")}</code>\n\n` +
+    `💌 Pesan: <i>"${escapeHtml(item.text || "-")}"</i>\n\n` +
+    `🕒 Waktu: ${timeStr}`;
+
+  sendBotMessage(msg.chat.id, text, { parse_mode: "HTML" });
+});
+
+// OWNER COMMAND: /recovery
+bot.onText(/^\/recovery(?:@\w+)?$/, async (msg) => {
+  await trackUser(msg.from);
+  if (!isOwner(msg.from.id))
+    return sendBotMessage(msg.chat.id, "❌ Command ini khusus owner.");
+
+  const needsRecovery = [...orders.values()].filter((o) =>
+    ["PAID", "PROCESSING", "FAILED", "REFUNDING", "REFUND_FAILED"].includes(
+      o.status,
+    ),
+  );
+
+  if (!needsRecovery.length) {
+    return sendBotMessage(
+      msg.chat.id,
+      "✅ Tidak ada order yang membutuhkan recovery.",
+    );
+  }
+
+  let text = `🚨 <b>ORDER PERLU RECOVERY</b>\n\n`;
+  needsRecovery.forEach((o, index) => {
+    text +=
+      `${index + 1}. 🎁 <b>${escapeHtml(o.giftName)}</b>\n` +
+      `👤 Buyer: <code>${o.buyerId}</code>\n` +
+      `👤 Recipient: ${escapeHtml(o.recipientUsername || String(o.recipientId))}\n` +
+      `⭐ Amount: ${o.price}\n` +
+      `💳 Charge ID: <code>${escapeHtml(o.telegramPaymentChargeId || "-")}</code>\n` +
+      `📌 Status: <b>${o.status}</b>\n\n`;
+  });
+
+  sendBotMessage(msg.chat.id, text, { parse_mode: "HTML" });
+});
+
+// OWNER COMMAND: /refund <user_id> <charge_id>
+bot.onText(
+  /^\/refund(?:@\w+)?(?:\s+(\d+))?(?:\s+(.+))?$/,
+  async (msg, match) => {
+    await trackUser(msg.from);
+    if (!isOwner(msg.from.id))
+      return sendBotMessage(msg.chat.id, "❌ Command ini khusus owner.");
+
+    const targetUserId = match[1];
+    const targetChargeId = match[2]?.trim();
+
+    if (!targetUserId || !targetChargeId) {
+      return sendBotMessage(
+        msg.chat.id,
+        "⚠️ Format salah.\nGunakan: <code>/refund &lt;user_id&gt; &lt;charge_id&gt;</code>",
+        { parse_mode: "HTML" },
+      );
+    }
+
+    // Cek apakah sudah pernah direfund
+    const alreadyRefunded = history.some(
+      (h) =>
+        h.telegramPaymentChargeId === targetChargeId &&
+        (h.status === "REFUNDED" || h.refundStatus === "REFUNDED"),
+    );
+
+    if (alreadyRefunded) {
+      return sendBotMessage(
+        msg.chat.id,
+        `⚠️ <b>REFUND DITOLAK</b>\n\nCharge ID <code>${escapeHtml(targetChargeId)}</code> sudah pernah di-refund sebelumnya.`,
+        { parse_mode: "HTML" },
+      );
+    }
+
+    await sendTyping(msg.chat.id);
+    console.log(
+      `Owner initiating manual refund for user ${targetUserId}, charge ${targetChargeId}`,
+    );
+
+    try {
+      await refundStarPayment(targetUserId, targetChargeId);
+
+      // Update status di orders & history
+      for (const [uid, ord] of orders.entries()) {
+        if (
+          ord.telegramPaymentChargeId === targetChargeId ||
+          String(ord.buyerId) === String(targetUserId)
+        ) {
+          ord.status = "REFUNDED";
+          ord.refundStatus = "REFUNDED";
+          await setOrder(uid, ord);
+        }
+      }
+
+      let hItem = history.find(
+        (h) => h.telegramPaymentChargeId === targetChargeId,
+      );
+
+      if (hItem) {
+        hItem.status = "REFUNDED";
+        hItem.refundStatus = "REFUNDED";
+
+        await updateHistoryByChargeId(targetChargeId, {
+          status: "REFUNDED",
+          refundStatus: "REFUNDED",
+        });
+      } else {
+        await addHistory({
+          payload: `manual_refund_${Date.now()}`,
+          buyerId: Number(targetUserId),
+          buyerLabel: String(targetUserId),
+          giftName: "Manual Refund",
+          price: 0,
+          status: "REFUNDED",
+          refundStatus: "REFUNDED",
+          telegramPaymentChargeId: targetChargeId,
+          timestamp: Date.now(),
+        });
+      }
+
+      sendBotMessage(
+        msg.chat.id,
+        `✅ <b>REFUND BERHASIL</b>\n\n` +
+          `👤 User: <code>${targetUserId}</code>\n` +
+          `💳 Charge ID: <code>${escapeHtml(targetChargeId)}</code>\n` +
+          `⭐ Stars telah dikembalikan.`,
+        { parse_mode: "HTML" },
+      );
+    } catch (err) {
+      logError(`Refund manual failed: ${err.message}`);
+      sendBotMessage(
+        msg.chat.id,
+        `❌ <b>REFUND GAGAL</b>\n\nError: <code>${escapeHtml(err.message)}</code>`,
+        { parse_mode: "HTML" },
+      );
+    }
+  },
+);
+
+// OWNER COMMAND: /broadcast
+bot.onText(/^\/broadcast(?:@\w+)?\s+(.+)$/, async (msg, match) => {
+  await trackUser(msg.from);
+  if (!isOwner(msg.from.id))
+    return sendBotMessage(msg.chat.id, "❌ Command ini khusus owner.");
 
   const textToBroadcast = match[1];
   let successCount = 0;
   let failCount = 0;
 
-  await sendBotMessage(msg.chat.id, "📢 Memulai siaran...");
+  const statusMsgId = await sendBotMessage(msg.chat.id, "📢 Memulai siaran...");
+  const userList = [...users.values()];
 
-  for (const user of users.values()) {
+  for (let i = 0; i < userList.length; i++) {
+    const u = userList[i];
     try {
-      // Pesan siaran harus pesan BARU — jangan edit pesan lama di chat user
       await bot.sendMessage(
-        user.id,
+        u.id,
         `📢 <b>Pemberitahuan:</b>\n\n${escapeHtml(textToBroadcast)}`,
-        {
-          parse_mode: "HTML",
-        },
+        { parse_mode: "HTML" },
       );
       successCount++;
-    } catch {
+    } catch (_) {
       failCount++;
     }
-    // FIX (#8): Jeda 100ms — lebih aman dari rate limit Telegram (~20-30 msg/detik)
+
+    // Update progress tiap 10 user agar owner mendapat info tanpa spamming
+    if ((i + 1) % 10 === 0 || i === userList.length - 1) {
+      try {
+        await bot.editMessageText(
+          `📢 <b>Memproses Siaran...</b> (${i + 1}/${userList.length})\n\n` +
+            `🟢 Berhasil: ${successCount}\n` +
+            `🔴 Gagal: ${failCount}`,
+          { chat_id: msg.chat.id, message_id: statusMsgId, parse_mode: "HTML" },
+        );
+      } catch (_) {}
+    }
+
     await new Promise((r) => setTimeout(r, 100));
   }
 
@@ -593,16 +867,13 @@ bot.onText(/^\/broadcast(?:@\w+)? (.+)/, async (msg, match) => {
   );
 });
 
-// /broadcast tanpa pesan — fallback
-bot.onText(/^\/broadcast(?:@\w+)?$/, (msg) => {
-  trackUser(msg.from);
+bot.onText(/^\/broadcast(?:@\w+)?$/, async (msg) => {
+  await trackUser(msg.from);
   if (!isOwner(msg.from.id)) return;
   sendBotMessage(
     msg.chat.id,
     "⚠️ Gunakan format: <code>/broadcast &lt;pesan&gt;</code>",
-    {
-      parse_mode: "HTML",
-    },
+    { parse_mode: "HTML" },
   );
 });
 
@@ -611,7 +882,7 @@ bot.onText(/^\/broadcast(?:@\w+)?$/, (msg) => {
 // ==============================
 
 bot.on("callback_query", async (query) => {
-  trackUser(query.from);
+  await trackUser(query.from);
   const data = query.data;
   const userId = query.from.id;
   const chatId = query.message.chat.id;
@@ -631,9 +902,6 @@ bot.on("callback_query", async (query) => {
         );
       }
 
-      // FIX (#5): Sembunyikan gift limited edition yang belum dimiliki bot
-      // (is_owned === false) — sendGift untuk gift seperti itu pasti gagal
-      // dan berujung refund.
       const sendableGifts = result.gifts.filter((g) => g.is_owned !== false);
 
       if (!sendableGifts.length) {
@@ -666,7 +934,7 @@ bot.on("callback_query", async (query) => {
       });
       rememberBotMsg(chatId, query.message.message_id);
     } catch (err) {
-      console.error(err.message);
+      logError(`Error callback menu:gifts: ${err.message}`);
       bot.answerCallbackQuery(query.id, {
         text: "Terjadi kesalahan.",
         show_alert: true,
@@ -689,11 +957,15 @@ bot.on("callback_query", async (query) => {
     } else {
       text = `📜 <b>RIWAYAT KIRIM GIFT KAMU</b>\n\n`;
       for (const h of mine) {
-        const t = new Date(h.timestamp).toLocaleString("id-ID", {
+        const t = new Date(
+          h.timestamp || h.createdAt || Date.now(),
+        ).toLocaleString("id-ID", {
           timeZone: "Asia/Jakarta",
         });
+        const statusIcon =
+          h.status === "SENT" ? "✅" : h.status === "REFUNDED" ? "⭐" : "❌";
         text +=
-          `${h.status === "SENT" ? "✅" : "❌"} ${escapeHtml(h.giftName)} → ${escapeHtml(h.recipientLabel)}\n` +
+          `${statusIcon} ${escapeHtml(h.giftName)} → ${escapeHtml(h.recipientLabel || String(h.recipientId))}\n` +
           `💰 ${h.price} ⭐ • 🕒 ${t}\n\n`;
       }
     }
@@ -740,6 +1012,7 @@ bot.on("callback_query", async (query) => {
     rememberBotMsg(chatId, query.message.message_id);
     return;
   }
+
   // MENU: DONATE
   if (data === "menu:donate") {
     await bot.answerCallbackQuery(query.id);
@@ -763,37 +1036,34 @@ bot.on("callback_query", async (query) => {
               url: "https://files.catbox.moe/w5sjnx.jpeg",
             },
           ],
-          [
-            {
-              text: "🏠 Menu Utama",
-              callback_data: "menu:home",
-            },
-          ],
+          [{ text: "🏠 Menu Utama", callback_data: "menu:home" }],
         ],
       },
     });
-
     rememberBotMsg(chatId, query.message.message_id);
     return;
   }
 
   // SELECT GIFT
   if (data?.startsWith("select:")) {
+    if (isMaintenanceActive(userId)) {
+      await bot.answerCallbackQuery(query.id);
+      return sendMaintenanceMsg(chatId);
+    }
+
     const giftId = data.split(":")[1];
 
-    // FIX (#2): Jangan timpa order yang masih punya invoice aktif
     if (hasActivePaymentOrder(userId)) {
       return bot.answerCallbackQuery(query.id, {
-        text: "Kamu masih punya invoice yang belum dibayar. Selesaikan dulu, atau ketik /cancel untuk membatalkan.",
+        text: "Kamu masih punya invoice/order aktif. Selesaikan dulu, atau ketik /cancel untuk membatalkan.",
         show_alert: true,
       });
     }
 
     try {
-      const result = await getAvailableGifts(true); // force refresh agar stok akurat
+      const result = await getAvailableGifts(true);
       const gift = result?.gifts?.find((g) => String(g.id) === String(giftId));
 
-      // FIX (#5): Verifikasi ulang gift benar-benar bisa dikirim
       if (!gift || gift.is_owned === false) {
         return bot.answerCallbackQuery(query.id, {
           text: "⚠️ Gift sudah tidak tersedia.",
@@ -803,7 +1073,7 @@ bot.on("callback_query", async (query) => {
 
       const giftName = getGiftName(gift);
 
-      setOrder(userId, {
+      await setOrder(userId, {
         buyerId: userId,
         giftId: gift.id,
         giftName,
@@ -814,7 +1084,6 @@ bot.on("callback_query", async (query) => {
 
       await bot.answerCallbackQuery(query.id);
 
-      // Edit pesan daftar gift menjadi prompt penerima
       await bot.editMessageText(
         `🎁 <b>Gift Dipilih: ${escapeHtml(giftName)}</b>\n\n` +
           `💰 Harga: <b>${gift.star_count} ⭐</b>\n\n` +
@@ -829,7 +1098,7 @@ bot.on("callback_query", async (query) => {
       );
       rememberBotMsg(chatId, query.message.message_id);
     } catch (err) {
-      console.error(err.message);
+      logError(`Error select gift: ${err.message}`);
       bot.answerCallbackQuery(query.id, {
         text: "Terjadi kesalahan.",
         show_alert: true,
@@ -840,6 +1109,19 @@ bot.on("callback_query", async (query) => {
 
   // PAY
   if (data === "pay") {
+    if (isMaintenanceActive(userId)) {
+      await bot.answerCallbackQuery(query.id);
+      return sendMaintenanceMsg(chatId);
+    }
+
+    // Double-click lock
+    if (invoiceCreationLock.has(userId)) {
+      return bot.answerCallbackQuery(query.id, {
+        text: "Sedang membuat invoice, harap tunggu...",
+        show_alert: true,
+      });
+    }
+
     const order = orders.get(String(userId));
 
     if (!order) {
@@ -856,19 +1138,24 @@ bot.on("callback_query", async (query) => {
       });
     }
 
+    invoiceCreationLock.add(userId);
+
     try {
-      // FIX (#5): Cek ulang stok/harga gift tepat sebelum invoice dibuat
       const giftsResult = await getAvailableGifts(true);
       const gift = giftsResult?.gifts?.find(
         (g) => String(g.id) === String(order.giftId),
       );
+
       if (!gift || gift.is_owned === false) {
+        invoiceCreationLock.delete(userId);
         return bot.answerCallbackQuery(query.id, {
           text: "Gift sudah tidak tersedia. Batalkan dengan /cancel lalu order ulang.",
           show_alert: true,
         });
       }
+
       if (gift.star_count !== order.price) {
+        invoiceCreationLock.delete(userId);
         return bot.answerCallbackQuery(query.id, {
           text: "Harga gift berubah. Batalkan dengan /cancel lalu order ulang.",
           show_alert: true,
@@ -878,11 +1165,9 @@ bot.on("callback_query", async (query) => {
       const payload = `gift_${userId}_${order.giftId}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
       order.payload = payload;
       order.status = "PAYMENT_CREATED";
-      setOrder(userId, order);
+      await setOrder(userId, order);
 
       await bot.answerCallbackQuery(query.id);
-
-      // Hapus pesan summary sebelumnya, invoice tampil sebagai pesan baru
       await clearBotMessages(chatId);
 
       const invoiceMsg = await bot.sendInvoice(
@@ -890,17 +1175,23 @@ bot.on("callback_query", async (query) => {
         order.giftName,
         `Kirim gift ${order.giftName} ke ${order.recipientUsername}`,
         payload,
-        "", // provider_token kosong untuk XTR (Stars)
+        "",
         "XTR",
         [{ label: order.giftName, amount: order.price }],
       );
+
       rememberBotMsg(chatId, invoiceMsg.message_id);
+      console.log(
+        `[PAYMENT] Invoice created for user ${userId}, payload: ${payload}`,
+      );
     } catch (err) {
-      console.error(err.message);
+      logError(`Gagal create invoice: ${err.message}`);
       bot.answerCallbackQuery(query.id, {
         text: "Gagal membuat invoice.",
         show_alert: true,
       });
+    } finally {
+      invoiceCreationLock.delete(userId);
     }
     return;
   }
@@ -917,11 +1208,10 @@ bot.on("callback_query", async (query) => {
     }
 
     order.status = "WAITING_TEXT";
-    setOrder(userId, order);
+    await setOrder(userId, order);
 
     await bot.answerCallbackQuery(query.id);
 
-    // Edit pesan pilihan menjadi prompt ketik pesan
     await bot.editMessageText(
       `💌 <b>Ketik pesan untuk gift-nya</b>\n\n` +
         `Maksimal <b>128 karakter</b>.\n\n` +
@@ -949,7 +1239,7 @@ bot.on("callback_query", async (query) => {
 
     order.text = "";
     order.status = "WAITING_PAYMENT";
-    setOrder(userId, order);
+    await setOrder(userId, order);
 
     await bot.answerCallbackQuery(query.id);
     await showOrderSummary(chatId, order, query.message.message_id);
@@ -958,33 +1248,28 @@ bot.on("callback_query", async (query) => {
 });
 
 // ==============================
-// TEXT INPUT HANDLER (RECEIVE USERNAME / PESAN GIFT)
+// TEXT INPUT HANDLER
 // ==============================
 
 bot.on("message", async (msg) => {
-  trackUser(msg.from);
+  await trackUser(msg.from);
 
-  // Abaikan command atau pesan non-teks
   if (!msg.text || msg.text.startsWith("/")) return;
-
-  await sendTyping(msg.chat.id);
 
   const userId = msg.from.id;
   const order = orders.get(String(userId));
 
-  if (
-    !order ||
-    (order.status !== "WAITING_RECIPIENT" && order.status !== "WAITING_TEXT")
-  ) {
+  if (!order || !["WAITING_RECIPIENT", "WAITING_TEXT"].includes(order.status)) {
     return;
   }
 
-  // ===== TAHAP: INPUT PESAN CUSTOM =====
+  await sendTyping(msg.chat.id);
+
+  // INPUT PESAN CUSTOM
   if (order.status === "WAITING_TEXT") {
     let giftText = msg.text.trim();
-    if (giftText === "-") giftText = ""; // shortcut: "-" tetap berlaku sebagai tanpa pesan
+    if (giftText === "-") giftText = "";
 
-    // Telegram membatasi text gift maksimal 128 karakter
     if (giftText.length > 128) {
       return sendBotMessage(
         msg.chat.id,
@@ -993,67 +1278,72 @@ bot.on("message", async (msg) => {
       );
     }
 
-    await deleteUserMessage(msg); // bersihkan input pesan dari chat
+    await deleteUserMessage(msg);
 
     order.text = giftText;
     order.status = "WAITING_PAYMENT";
-    setOrder(userId, order);
+    await setOrder(userId, order);
 
     await showOrderSummary(msg.chat.id, order);
     return;
   }
 
-  let usernameInput = msg.text.trim();
-  if (!usernameInput.startsWith("@")) {
-    usernameInput = `@${usernameInput}`;
-  }
+  // INPUT RECIPIENT
+  if (order.status === "WAITING_RECIPIENT") {
+    if (isMaintenanceActive(userId)) {
+      return sendMaintenanceMsg(msg.chat.id);
+    }
 
-  if (!/^@[A-Za-z0-9_]{5,32}$/.test(usernameInput)) {
-    return sendBotMessage(
+    let usernameInput = msg.text.trim();
+    if (!usernameInput.startsWith("@")) {
+      usernameInput = `@${usernameInput}`;
+    }
+
+    if (!/^@[A-Za-z0-9_]{5,32}$/.test(usernameInput)) {
+      return sendBotMessage(
+        msg.chat.id,
+        "❌ Format username tidak valid.\nContoh: <code>@username</code>",
+        { parse_mode: "HTML" },
+      );
+    }
+
+    const targetUsername = usernameInput.slice(1).toLowerCase();
+    const recipient = await findUserByUsername(targetUsername);
+
+    if (!recipient) {
+      return sendBotMessage(
+        msg.chat.id,
+        `❌ <b>Gagal menemukan user ${escapeHtml(usernameInput)}</b>\n\n` +
+          `Akun tersebut harus sudah pernah mengirim /start ke bot ini.`,
+        { parse_mode: "HTML" },
+      );
+    }
+
+    await deleteUserMessage(msg);
+
+    order.recipientId = recipient.id;
+    order.recipientUsername = `@${recipient.username}`;
+    order.status = "WAITING_MESSAGE_CHOICE";
+    await setOrder(userId, order);
+
+    await sendBotMessage(
       msg.chat.id,
-      "❌ Format username tidak valid.\nContoh: <code>@username</code>",
-      { parse_mode: "HTML" },
-    );
-  }
-
-  const targetUsername = usernameInput.slice(1).toLowerCase();
-  const recipient = [...users.values()].find(
-    (u) => u.username === targetUsername,
-  );
-
-  if (!recipient) {
-    return sendBotMessage(
-      msg.chat.id,
-      `❌ <b>Gagal menemukan user ${escapeHtml(usernameInput)}</b>\n\n` +
-        `Akun tersebut harus sudah pernah mengirim /start ke bot ini.`,
-      { parse_mode: "HTML" },
-    );
-  }
-
-  await deleteUserMessage(msg); // bersihkan input username dari chat
-
-  order.recipientId = recipient.id;
-  order.recipientUsername = `@${recipient.username}`;
-  order.status = "WAITING_MESSAGE_CHOICE";
-  setOrder(userId, order);
-
-  // Edit prompt username menjadi pilihan pesan
-  await sendBotMessage(
-    msg.chat.id,
-    `💌 <b>Penerima: ${escapeHtml(order.recipientUsername)}</b>\n\n` +
-      `Mau tambahkan pesan di gift-nya?`,
-    {
-      parse_mode: "HTML",
-      reply_markup: {
-        inline_keyboard: [
-          [
-            { text: "💌 Tambah Pesan", callback_data: "msg:add" },
-            { text: "⏭️ Tanpa Pesan", callback_data: "msg:skip" },
+      `💌 <b>Penerima: ${escapeHtml(order.recipientUsername)}</b>\n\n` +
+        `Mau tambahkan pesan di gift-nya?`,
+      {
+        parse_mode: "HTML",
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: "💌 Tambah Pesan", callback_data: "msg:add" },
+              { text: "⏭️ Tanpa Pesan", callback_data: "msg:skip" },
+            ],
           ],
-        ],
+        },
       },
-    },
-  );
+    );
+    return;
+  }
 });
 
 // ==============================
@@ -1061,14 +1351,12 @@ bot.on("message", async (msg) => {
 // ==============================
 
 bot.on("pre_checkout_query", async (query) => {
-  trackUser(query.from);
+  await trackUser(query.from);
 
   const order = [...orders.values()].find(
     (o) => o.payload === query.invoice_payload,
   );
 
-  // Verifikasi pemilik + status order harus masih PAYMENT_CREATED
-  // (mencegah invoice lama di-reuse setelah order selesai/diganti)
   if (
     !order ||
     Number(order.buyerId) !== query.from.id ||
@@ -1101,97 +1389,79 @@ bot.on("pre_checkout_query", async (query) => {
 bot.on("message", async (msg) => {
   if (!msg.successful_payment) return;
 
-  trackUser(msg.from);
+  await trackUser(msg.from);
   const payment = msg.successful_payment;
   const chatId = msg.chat.id;
+  const chargeId = payment.telegram_payment_charge_id;
 
-  // FIX (#4): Idempotency — payload yang sudah berhasil diproses tidak
-  // diproses ulang (Telegram bisa me-redeliver update setelah crash).
+  console.log(
+    `[PAYMENT] Successful payment received. Payload: ${payment.invoice_payload}, Charge ID: ${chargeId}`,
+  );
+
+  // Protection duplicate payload
   if (processedPayloads.has(payment.invoice_payload)) {
-    await bot.sendMessage(
+    return bot.sendMessage(
       chatId,
       "✅ Pembayaran ini sudah diproses sebelumnya.",
     );
-    return;
   }
 
-  const order = [...orders.values()].find(
+  let order = [...orders.values()].find(
     (o) => o.payload === payment.invoice_payload,
   );
 
-  // FIX (#1): Payload tidak dikenali — BISA JADI order terhapus cleanup.
-  // Jangan cuma bilang ke user: alert owner untuk investigasi/refund manual.
   if (!order || Number(order.buyerId) !== msg.from.id) {
-    console.error("Pembayaran tak dikenali:", JSON.stringify(payment));
+    logError(`Pembayaran tidak dikenali. Payload: ${payment.invoice_payload}`);
     try {
       await bot.sendMessage(
         OWNER_ID,
         `🚨 <b>PEMBAYARAN TAK DIKENALI</b>\n\n` +
           `👤 Dari: <code>${msg.from.id}</code> ${escapeHtml(msg.from.username ? "@" + msg.from.username : "")}\n` +
           `🧾 Payload: <code>${escapeHtml(payment.invoice_payload)}</code>\n` +
+          `💳 Charge ID: <code>${escapeHtml(chargeId || "-")}</code>\n` +
           `💰 Amount: ${payment.total_amount} ${escapeHtml(payment.currency)}\n\n` +
-          `Kemungkinan order terhapus cleanup sebelum dibayar. CEK & REFUND MANUAL.`,
+          `Data order tidak ditemukan di sistem. CEK & REFUND MANUAL.`,
         { parse_mode: "HTML" },
       );
-    } catch (e) {
-      console.error("Gagal notif owner:", e.message);
-    }
+    } catch (_) {}
     return bot.sendMessage(
       chatId,
-      "⚠️ Pembayaranmu sudah kami terima, tetapi data order-nya tidak ditemukan. Owner sudah diberitahu dan akan memproses pengiriman/refund. Simpan bukti pembayaran ini.",
+      "⚠️ Pembayaranmu sudah kami terima, tetapi data order-nya tidak ditemukan. Admin telah diberitahu.",
     );
   }
 
-  // FIX (#4): Order sudah PAID = sudah pernah masuk handler ini (mungkin
-  // crash di tengah setelah sendGift). JANGAN kirim gift ulang — suruh owner verifikasi.
-  if (order.status === "PAID") {
-    console.error(
-      "Redelivery successful_payment untuk order PAID:",
-      payment.invoice_payload,
-    );
-    try {
-      await bot.sendMessage(
-        OWNER_ID,
-        `⚠️ <b>UPDATE PEMBAYARAN ULANG</b>\n\n` +
-          `Payload: <code>${escapeHtml(payment.invoice_payload)}</code>\n` +
-          `Buyer: <code>${order.buyerId}</code>\n\n` +
-          `Gift TIDAK dikirim ulang. Verifikasi apakah gift sudah terkirim sebelumnya.`,
-        { parse_mode: "HTML" },
-      );
-    } catch (e) {
-      console.error("Gagal notif owner:", e.message);
-    }
-    return bot.sendMessage(
-      chatId,
-      "⚠️ Pembayaran ini sudah pernah diproses. Jika gift belum diterima, hubungi admin.",
-    );
+  if (
+    order.status === "PAID" ||
+    order.status === "PROCESSING" ||
+    order.status === "SENT"
+  ) {
+    return bot.sendMessage(chatId, "⚠️ Pembayaran ini sudah pernah diproses.");
   }
 
   if (payment.total_amount !== order.price || payment.currency !== "XTR") {
     return bot.sendMessage(
       chatId,
-      "⚠️ Nominal pembayaran tidak cocok dengan order. Hubungi admin.",
+      "⚠️ Nominal pembayaran tidak cocok dengan order.",
     );
   }
 
-  // Tandai PAID SEBELUM kirim gift — jika proses mati di tengah,
-  // order tetap tersimpan di disk dan bisa diinvestigasi owner
+  // Update order status & simpan charge ID
+  order.telegramPaymentChargeId = chargeId;
   order.status = "PAID";
-  setOrder(order.buyerId, order);
+  await setOrder(order.buyerId, order);
+
+  order.status = "PROCESSING";
+  await setOrder(order.buyerId, order);
 
   try {
-    // Kirim Gift beserta pesan custom (jika ada)
+    // Eksekusi Pengiriman Gift
     await sendGift(order.recipientId, order.giftId, order.text || "");
 
-    const successText = order.text
-      ? `💌 Pesan: <i>"${escapeHtml(order.text)}"</i>\n`
-      : "";
-
-    // FIX (#4): Tandai payload sebagai terproses SEBELUM menghapus order
+    order.status = "SENT";
+    await setOrder(order.buyerId, order);
     processedPayloads.add(payment.invoice_payload);
 
-    // Catat ke riwayat (audit trail) sebelum order dihapus
-    addHistory({
+    await addHistory({
       payload: payment.invoice_payload,
       buyerId: msg.from.id,
       buyerLabel: msg.from.username
@@ -1204,10 +1474,16 @@ bot.on("message", async (msg) => {
       price: order.price,
       text: order.text || "",
       status: "SENT",
+      telegramPaymentChargeId: chargeId,
+      createdAt: order.createdAt,
       timestamp: Date.now(),
     });
 
-    // Notif ke penerima gift
+    console.log(
+      `[ORDER] Gift sent successfully. Payload: ${payment.invoice_payload}`,
+    );
+
+    // Notifikasi Penerima
     try {
       const buyerName = msg.from.username
         ? `@${msg.from.username}`
@@ -1219,17 +1495,17 @@ bot.on("message", async (msg) => {
       if (order.text) {
         notifText += `💌 Pesan: <i>"${escapeHtml(order.text)}"</i>\n`;
       }
-      // Notif ke penerima harus pesan BARU di chat mereka
       await bot.sendMessage(order.recipientId, notifText, {
         parse_mode: "HTML",
       });
     } catch (e) {
-      // Penerima mungkin blokir bot — gift tetap terkirim
-      console.error("Gagal notif penerima:", e.message);
+      logError(`Gagal kirim notif penerima: ${e.message}`);
     }
 
-    // FIX (#3): Pesan invoice TIDAK bisa di-edit oleh Telegram.
-    // Kirim konfirmasi sebagai pesan BARU, bukan edit invoice.
+    // Konfirmasi Buyer
+    const successText = order.text
+      ? `💌 Pesan: <i>"${escapeHtml(order.text)}"</i>\n`
+      : "";
     const confirmMsg = await bot.sendMessage(
       chatId,
       `✅ <b>Pembayaran & Pengiriman Berhasil!</b>\n\n` +
@@ -1240,102 +1516,376 @@ bot.on("message", async (msg) => {
       { parse_mode: "HTML" },
     );
     rememberBotMsg(chatId, confirmMsg.message_id);
+    await clearOrder(order.buyerId);
   } catch (err) {
-    console.error("Gagal mengirim gift:", err.message);
+    logError(
+      `sendGift failed for payload ${payment.invoice_payload}: ${err.message}`,
+    );
 
-    // Catat kegagalan ke riwayat (penting untuk refund/audit)
-    addHistory({
-      payload: payment.invoice_payload,
-      buyerId: msg.from.id,
-      buyerLabel: msg.from.username
-        ? `@${msg.from.username}`
-        : msg.from.first_name || String(msg.from.id),
-      recipientId: order.recipientId,
-      recipientLabel: order.recipientUsername,
-      giftId: order.giftId,
-      giftName: order.giftName,
-      price: order.price,
-      text: order.text || "",
-      status: "FAILED",
-      error: err.message,
-      timestamp: Date.now(),
-    });
-
-    // FIX (#5 konsistensi): Pertahankan order FAILED 24 jam di orders.json
-    // (untuk investigasi owner), lalu dihapus otomatis oleh cleanup interval.
     order.status = "FAILED";
     order.error = err.message;
-    setOrder(order.buyerId, order);
+    await setOrder(order.buyerId, order);
 
-    // Kirim notif ke owner untuk investigasi
+    // AUTO REFUND ATTEMPT
+    order.status = "REFUNDING";
+    await setOrder(order.buyerId, order);
+
+    let refundSuccess = false;
+    let refundErrorMsg = "";
+
     try {
-      // Alert ke owner harus pesan BARU — alert lama tidak boleh ditimpa
-      await bot.sendMessage(
-        OWNER_ID,
-        `🚨 <b>GIFT GAGAL TERKIRIM!</b>\n\n` +
-          `👤 Buyer: <code>${order.buyerId}</code>\n` +
-          `🎁 Gift: ${escapeHtml(order.giftName)}\n` +
-          `📦 Recipient: ${escapeHtml(order.recipientUsername)} (<code>${order.recipientId}</code>)\n` +
-          `💰 Amount: ${order.price} ⭐\n` +
-          `🧾 Payload: <code>${escapeHtml(payment.invoice_payload)}</code>\n` +
-          `❌ Error: <code>${escapeHtml(err.message)}</code>`,
-        { parse_mode: "HTML" },
-      );
-    } catch (e) {
-      console.error("Gagal notif owner:", e.message);
+      if (chargeId) {
+        await refundStarPayment(order.buyerId, chargeId);
+        refundSuccess = true;
+      } else {
+        refundErrorMsg = "Charge ID tidak tersedia";
+      }
+    } catch (rErr) {
+      refundErrorMsg = rErr.message;
     }
 
-    await bot.sendMessage(
-      chatId,
-      `❌ <b>Pembayaran diterima, tetapi gift gagal dikirim!</b>\n\n` +
-        `Tim kami sudah diberitahu dan akan memproses pemeriksaan/refund.\n` +
-        `Error: <code>${escapeHtml(err.message)}</code>`,
-      { parse_mode: "HTML" },
-    );
-    return;
-  }
+    if (refundSuccess) {
+      order.status = "REFUNDED";
+      order.refundStatus = "REFUNDED";
+      await setOrder(order.buyerId, order);
+      processedPayloads.add(payment.invoice_payload);
 
-  // Sukses penuh — baru hapus order dari map
-  clearOrder(order.buyerId);
+      await addHistory({
+        payload: payment.invoice_payload,
+        buyerId: msg.from.id,
+        buyerLabel: msg.from.username
+          ? `@${msg.from.username}`
+          : String(msg.from.id),
+        recipientId: order.recipientId,
+        recipientLabel: order.recipientUsername,
+        giftId: order.giftId,
+        giftName: order.giftName,
+        price: order.price,
+        text: order.text || "",
+        status: "FAILED",
+        error: err.message,
+        refundStatus: "REFUNDED",
+        telegramPaymentChargeId: chargeId,
+        createdAt: order.createdAt,
+        timestamp: Date.now(),
+      });
+
+      console.log(`[REFUND] Auto-refund successful for charge ID ${chargeId}`);
+
+      // Owner Notification
+      try {
+        await bot.sendMessage(
+          OWNER_ID,
+          `🚨 <b>GIFT GAGAL TERKIRIM (AUTO-REFUND BERHASIL)</b>\n\n` +
+            `👤 Buyer: <code>${order.buyerId}</code>\n` +
+            `🎁 Gift: ${escapeHtml(order.giftName)}\n` +
+            `📦 Recipient: ${escapeHtml(order.recipientUsername)}\n` +
+            `💰 Amount: ${order.price} ⭐\n` +
+            `🧾 Payload: <code>${escapeHtml(payment.invoice_payload)}</code>\n` +
+            `💳 Charge ID: <code>${escapeHtml(chargeId)}</code>\n\n` +
+            `❌ Error: <code>${escapeHtml(err.message)}</code>\n` +
+            `💸 Refund: <b>SUCCESS</b>`,
+          { parse_mode: "HTML" },
+        );
+      } catch (_) {}
+
+      // User Notification
+      await bot.sendMessage(
+        chatId,
+        `❌ <b>Gift gagal dikirim.</b>\n\n` +
+          `Pembayaran kamu sudah dikembalikan otomatis.\n` +
+          `⭐ Refund: <b>Berhasil</b>\n\n` +
+          `Jika Stars belum terlihat, tunggu beberapa saat.`,
+        { parse_mode: "HTML" },
+      );
+    } else {
+      order.status = "REFUND_FAILED";
+      order.refundStatus = "REFUND_FAILED";
+      order.refundError = refundErrorMsg;
+      await setOrder(order.buyerId, order);
+
+      await addHistory({
+        payload: payment.invoice_payload,
+        buyerId: msg.from.id,
+        buyerLabel: msg.from.username
+          ? `@${msg.from.username}`
+          : String(msg.from.id),
+        recipientId: order.recipientId,
+        recipientLabel: order.recipientUsername,
+        giftId: order.giftId,
+        giftName: order.giftName,
+        price: order.price,
+        text: order.text || "",
+        status: "FAILED",
+        error: err.message,
+        refundStatus: "REFUND_FAILED",
+        refundError: refundErrorMsg,
+        telegramPaymentChargeId: chargeId,
+        createdAt: order.createdAt,
+        timestamp: Date.now(),
+      });
+
+      console.error(
+        `[REFUND ERROR] Auto-refund failed for charge ID ${chargeId}: ${refundErrorMsg}`,
+      );
+
+      // Owner Notification
+      try {
+        await bot.sendMessage(
+          OWNER_ID,
+          `🚨 <b>GIFT GAGAL TERKIRIM & REFUND GAGAL!</b>\n\n` +
+            `👤 Buyer: <code>${order.buyerId}</code>\n` +
+            `🎁 Gift: ${escapeHtml(order.giftName)}\n` +
+            `📦 Recipient: ${escapeHtml(order.recipientUsername)}\n` +
+            `💰 Amount: ${order.price} ⭐\n` +
+            `🧾 Payload: <code>${escapeHtml(payment.invoice_payload)}</code>\n` +
+            `💳 Charge ID: <code>${escapeHtml(chargeId)}</code>\n\n` +
+            `❌ Gift Error: <code>${escapeHtml(err.message)}</code>\n` +
+            `💸 Refund Error: <code>${escapeHtml(refundErrorMsg)}</code>`,
+          { parse_mode: "HTML" },
+        );
+      } catch (_) {}
+
+      // User Notification
+      await bot.sendMessage(
+        chatId,
+        `⚠️ <b>Gift gagal dikirim.</b>\n\n` +
+          `Pembayaran sudah diterima, tetapi refund otomatis mengalami kendala.\n` +
+          `Admin sudah diberitahu.\n\n` +
+          `🧾 Simpan bukti pembayaran ini.`,
+        { parse_mode: "HTML" },
+      );
+    }
+  }
 });
 
 // ==============================
-// AUTO-DELETE PESAN USER
+// AUTO-DELETE PESAN USER & COMMANDS
 // ==============================
-// Handler ini didaftarkan TERAKHIR, jalan setelah semua handler lain selesai.
-// Semua pesan teks user (input username / pesan gift) langsung dihapus
-// supaya chat tidak menumpuk. Command (/) tetap disimpan sebagai jejak.
 
-bot.on("message", (msg) => {
-  // Pesan service (successful_payment, gift, dll) tidak punya text — tidak disentuh
+bot.on("message", async (msg) => {
   if (!msg.text) return;
-  // Command (/) tetap disimpan sebagai jejak — yang dihapus cuma pesan input biasa
-  if (msg.text.startsWith("/")) return;
+
+  const userId = String(msg.from.id);
+
+  // JIKA PESAN ADALAH COMMAND (Diawali '/')
+  if (msg.text.startsWith("/")) {
+    // Hapus command sebelumnya jika ada
+    const previousCommandId = lastUserCommandMsg.get(userId);
+    if (previousCommandId) {
+      try {
+        await bot.deleteMessage(msg.chat.id, previousCommandId);
+      } catch (_) {
+        // Abaikan jika pesan sudah terhapus
+      }
+    }
+
+    // Simpan message_id command yang baru
+    lastUserCommandMsg.set(userId, msg.message_id);
+    return;
+  }
+
+  // JIKA PESAN BIASA (BUKAN COMMAND)
   deleteUserMessage(msg);
 });
 
 // ==============================
-// GLOBAL ERROR HANDLERS
+// MESSAGE LOGGER
+// ==============================
+
+bot.on("message", (msg) => {
+  const date = new Date().toLocaleString("id-ID");
+
+  const userId = msg.from?.id || "-";
+  const username = msg.from?.username ? `@${msg.from.username}` : "-";
+
+  const firstName = msg.from?.first_name || "-";
+  const lastName = msg.from?.last_name || "";
+
+  const chatId = msg.chat?.id || "-";
+  const chatType = msg.chat?.type || "-";
+  const messageId = msg.message_id || "-";
+
+  let messageType = "UNKNOWN";
+  let content = "";
+
+  if (msg.text) {
+    messageType = "TEXT";
+    content = msg.text;
+  } else if (msg.photo) {
+    messageType = "PHOTO";
+    content = "[Foto]";
+  } else if (msg.video) {
+    messageType = "VIDEO";
+    content = "[Video]";
+  } else if (msg.document) {
+    messageType = "DOCUMENT";
+    content = `[Dokumen] ${msg.document.file_name || ""}`;
+  } else if (msg.sticker) {
+    messageType = "STICKER";
+    content = `[Sticker] ${msg.sticker.emoji || ""}`;
+  } else if (msg.voice) {
+    messageType = "VOICE";
+    content = "[Voice Message]";
+  } else if (msg.audio) {
+    messageType = "AUDIO";
+    content = `[Audio] ${msg.audio.title || ""}`;
+  } else if (msg.video_note) {
+    messageType = "VIDEO_NOTE";
+    content = "[Video Note]";
+  } else if (msg.location) {
+    messageType = "LOCATION";
+    content = "[Location]";
+  } else if (msg.contact) {
+    messageType = "CONTACT";
+    content = "[Contact]";
+  } else {
+    content = "[Pesan non-text]";
+  }
+
+  console.log(`
+╭──────────────────────────────────
+│ 📩 MESSAGE MASUK
+├──────────────────────────────────
+│ 🕐 Waktu     : ${date}
+│ 👤 User ID   : ${userId}
+│ 🔹 Username  : ${username}
+│ 📝 Nama      : ${firstName} ${lastName}
+│ 💬 Chat ID   : ${chatId}
+│ 📱 Chat Type : ${chatType}
+│ 🆔 Message ID: ${messageId}
+│ 📦 Tipe      : ${messageType}
+│ 💭 Pesan     : ${content}
+╰──────────────────────────────────
+`);
+});
+
+// ==============================
+// CRASH RECOVERY & STARTUP CHECK
+// ==============================
+
+function performCrashRecoveryCheck() {
+  const needsRecovery = [...orders.values()].filter((o) =>
+    ["PAID", "PROCESSING", "FAILED", "REFUNDING", "REFUND_FAILED"].includes(
+      o.status,
+    ),
+  );
+
+  if (needsRecovery.length > 0) {
+    console.log(
+      `Crash recovery detected ${needsRecovery.length} unhandled order(s).`,
+    );
+    try {
+      let recoveryMsg = `🚨 <b>RECOVERY SISTEM (BOT RESTART)</b>\n\nDitemukan <b>${needsRecovery.length}</b> order perlu penanganan:\n\n`;
+      needsRecovery.forEach((o, index) => {
+        recoveryMsg +=
+          `${index + 1}. 🎁 ${escapeHtml(o.giftName)}\n` +
+          `👤 Buyer: <code>${o.buyerId}</code>\n` +
+          `📌 Status: <b>${o.status}</b>\n` +
+          `💳 Charge ID: <code>${escapeHtml(o.telegramPaymentChargeId || "-")}</code>\n\n`;
+      });
+      recoveryMsg += `Gunakan command /recovery untuk detail.`;
+
+      bot
+        .sendMessage(OWNER_ID, recoveryMsg, { parse_mode: "HTML" })
+        .catch(() => {});
+    } catch (e) {
+      logError(`Gagal notif recovery ke owner: ${e.message}`);
+    }
+  }
+}
+
+// ==============================
+// GLOBAL ERROR HANDLERS & SHUTDOWN
 // ==============================
 
 bot.on("polling_error", (err) => {
-  console.error("Polling error:", err.message);
+  console.error(`[POLLING ERROR] ${err.message}`);
 });
 
 process.on("unhandledRejection", (reason) => {
-  console.error("Unhandled Rejection:", reason);
+  console.error(`[UNHANDLED REJECTION] ${reason}`);
 });
 
-process.on("SIGINT", () => {
-  saveOrders();
-  saveUsers();
-  process.exit(0);
-});
+async function gracefulShutdown(signal) {
+  console.log(`\n[${signal}] Menerima sinyal shutdown.`);
+  console.log(`Bot shutting down cleanly via ${signal}`);
+
+  try {
+    await bot.stopPolling();
+  } catch (_) {}
+
+  try {
+    await closeDB();
+  } catch (_) {}
+
+  setTimeout(() => process.exit(0), 1000);
+}
+
+process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
 
 // ==============================
 // BOT READY
 // ==============================
 
-console.log(
-  `🤖 Nifz Gift Bot aktif. Users: ${users.size}, Orders tersimpan: ${orders.size}`,
-);
+async function initializeBot() {
+  try {
+    await connectDB();
+
+    // Load users
+    const db = getDB();
+    const dbUsers = await db.users.find({}).toArray();
+
+    for (const user of dbUsers) {
+      users.set(String(user.id), user);
+    }
+
+    // Load orders
+    const dbOrders = await getOrders(10000);
+
+    for (const order of dbOrders) {
+      orders.set(String(order.buyerId), order);
+    }
+
+    // Load history
+    const dbHistory = await getHistory(10000);
+
+    history.push(...dbHistory);
+
+    // Load settings
+    settings = await getSettings();
+
+    // Restore processed payloads
+    for (const item of history) {
+      if (
+        item.status === "SENT" ||
+        item.status === "REFUNDED" ||
+        item.refundStatus === "REFUNDED"
+      ) {
+        if (item.payload) {
+          processedPayloads.add(String(item.payload));
+        }
+      }
+    }
+
+    performCrashRecoveryCheck();
+
+    console.log(`👤 Users: ${users.size}`);
+
+    console.log(`📦 Active Orders: ${orders.size}`);
+
+    console.log(`📜 History: ${history.length}`);
+
+    console.log(`⚙️ Maintenance: ${settings.maintenance}`);
+
+    bot.startPolling();
+
+    console.log("🤖 Nifz Gift Bot berjalan.");
+  } catch (error) {
+    console.error("❌ Gagal menjalankan bot:", error);
+    process.exit(1);
+  }
+}
+
+initializeBot();
